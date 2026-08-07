@@ -141,7 +141,7 @@ from the same place** so query vectors and stored vectors are comparable:
 
 **The model must load from a Unity Catalog Volume, not download from
 Hugging Face at runtime** (`MODEL_CACHE_PATH`, default
-`/Volumes/hv_external_catalog/weather_schema/ml_models` - adjust to a
+`/Volumes/hv_external_catalog/watchlist_schema/ml_models` - adjust to a
 catalog/schema your workspace actually has). Serverless compute has no
 reliable internet egress for that download. Both the notebook and `app.py`
 set `HF_HUB_OFFLINE=1` before loading the model whenever `MODEL_CACHE_PATH`

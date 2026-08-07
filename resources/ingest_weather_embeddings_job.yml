@@ -39,7 +39,7 @@ resources:
               documents_table_name: "weather_documents"
               embeddings_table_name: "weather_embeddings"
               embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
-              model_cache_path: "/Volumes/hv_external_catalog/weather_schema/ml_models"
+              model_cache_path: "/Volumes/hv_external_catalog/watchlist_schema/ml_models"
               chunk_size: "800"
               chunk_overlap: "100"
               batch_size: "100"

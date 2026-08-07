@@ -12,4 +12,4 @@ env:
   - name: EMBEDDING_MODEL_NAME
     value: "sentence-transformers/all-MiniLM-L6-v2"
   - name: MODEL_CACHE_PATH
-    value: "/Volumes/hv_external_catalog/weather_schema/ml_models"
+    value: "/Volumes/hv_external_catalog/watchlist_schema/ml_models"
