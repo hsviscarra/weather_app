@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Weather Watchlist</title>
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card-bg: #ffffff;
+      --border: #e4e7ee;
+      --text: #1f2430;
+      --muted: #6b7280;
+      --accent: #4f46e5;
+      --accent-hover: #4338ca;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      max-width: 720px;
+      margin: 48px auto;
+      padding: 0 20px;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    h1 { font-size: 24px; font-weight: 700; margin-bottom: 4px; }
+    h2 { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
+
+    .hint { color: var(--muted); font-size: 13px; margin-top: 4px; line-height: 1.5; }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-top: 24px;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, 0.04);
+    }
+
+    .row { display: flex; gap: 12px; }
+    .row > div { flex: 1; }
+
+    label { display: block; margin-top: 16px; font-weight: 600; font-size: 13px; color: var(--text); }
+    label:first-child { margin-top: 0; }
+
+    input[type="text"], input[type="number"] {
+      width: 100%;
+      padding: 10px 12px;
+      margin-top: 6px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 14px;
+      transition: border-color 0.15s ease;
+    }
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+    }
+
+    button {
+      margin-top: 18px;
+      padding: 10px 18px;
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 600;
+      transition: background 0.15s ease;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .sync-btn { background: #16a34a; }
+    .sync-btn:hover { background: #15803d; }
+
+    #result {
+      margin-top: 16px;
+      white-space: pre-wrap;
+      background: #f6f6f6;
+      padding: 12px 14px;
+      border-radius: 8px;
+      min-height: 20px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    #result:empty { display: none; }
+
+    table { width: 100%; margin-top: 0; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; font-weight: 600; }
+    tbody tr:hover { background: #fafbfe; }
+    tbody tr:last-child td { border-bottom: none; }
+
+    .empty-row td { color: var(--muted); text-align: center; padding: 20px 8px; }
+
+    .delete-btn {
+      margin-top: 0;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid var(--danger);
+    }
+    .delete-btn:hover { background: var(--danger); color: #fff; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 100px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .badge-alert { background: #fee2e2; color: #b91c1c; }
+    .badge-forecast { background: #e0e7ff; color: #4338ca; }
+
+    .narrative { max-width: 320px; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Weather Watchlist</h1>
+  <p class="hint">Track locations by latitude/longitude. Syncing pulls active alerts and forecast periods from the National Weather Service (api.weather.gov) into Lakebase.</p>
+
+  <div class="card">
+    <h2>Add a location</h2>
+    <form id="location-form">
+      <label for="label">Label (optional)</label>
+      <input type="text" id="label" placeholder="Sacramento, CA">
+      <div class="row">
+        <div>
+          <label for="lat">Latitude</label>
+          <input type="number" id="lat" step="any" placeholder="38.5816" required>
+        </div>
+        <div>
+          <label for="lon">Longitude</label>
+          <input type="number" id="lon" step="any" placeholder="-121.4944" required>
+        </div>
+      </div>
+      <button type="submit">Add to watchlist</button>
+    </form>
+    <div id="result"></div>
+  </div>
+
+  <div class="card">
+    <h2>Watched locations</h2>
+    <table id="watchlist-table">
+      <thead>
+        <tr><th>Label</th><th>Lat</th><th>Lon</th><th>Added</th><th></th></tr>
+      </thead>
+      <tbody id="watchlist-body"></tbody>
+    </table>
+    <button type="button" id="sync-btn" class="sync-btn">Sync now</button>
+  </div>
+
+  <div class="card">
+    <h2>Recent weather documents</h2>
+    <table id="documents-table">
+      <thead>
+        <tr><th>Location</th><th>Type</th><th>Headline</th><th>Narrative</th><th>Synced</th></tr>
+      </thead>
+      <tbody id="documents-body"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const form = document.getElementById("location-form");
+    const resultEl = document.getElementById("result");
+    const watchlistBody = document.getElementById("watchlist-body");
+    const documentsBody = document.getElementById("documents-body");
+    const syncBtn = document.getElementById("sync-btn");
+
+    async function loadWatchlist() {
+      const resp = await fetch("/watchlist");
+      const data = await resp.json();
+      if (!resp.ok) {
+        resultEl.textContent = "Error loading watchlist: " + (data.error || resp.statusText);
+        return;
+      }
+      watchlistBody.innerHTML = "";
+      if (!data.length) {
+        watchlistBody.innerHTML = `<tr class="empty-row"><td colspan="5">No locations yet. Add one above to get started.</td></tr>`;
+        return;
+      }
+      data.forEach((row) => {
+        const tr = document.createElement("tr");
+        const added = row.added_at ? new Date(row.added_at).toLocaleString() : "-";
+        tr.innerHTML = `
+          <td>${row.label}</td>
+          <td>${Number(row.lat).toFixed(4)}</td>
+          <td>${Number(row.lon).toFixed(4)}</td>
+          <td>${added}</td>
+          <td><button type="button" class="delete-btn" data-lat="${row.lat}" data-lon="${row.lon}">Remove</button></td>
+        `;
+        watchlistBody.appendChild(tr);
+      });
+    }
+
+    async function loadDocuments() {
+      const resp = await fetch("/documents?limit=25");
+      const data = await resp.json();
+      if (!resp.ok) return;
+      documentsBody.innerHTML = "";
+      if (!data.length) {
+        documentsBody.innerHTML = `<tr class="empty-row"><td colspan="5">No documents synced yet. Click "Sync now" above.</td></tr>`;
+        return;
+      }
+      data.forEach((doc) => {
+        const tr = document.createElement("tr");
+        const synced = doc.synced_at ? new Date(doc.synced_at).toLocaleString() : "-";
+        const badgeClass = doc.source_type === "alert" ? "badge-alert" : "badge-forecast";
+        tr.innerHTML = `
+          <td>${doc.location}</td>
+          <td><span class="badge ${badgeClass}">${doc.source_type}</span></td>
+          <td>${doc.headline}</td>
+          <td class="narrative">${(doc.narrative_text || "").slice(0, 120)}</td>
+          <td>${synced}</td>
+        `;
+        documentsBody.appendChild(tr);
+      });
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const label = document.getElementById("label").value;
+      const lat = document.getElementById("lat").value;
+      const lon = document.getElementById("lon").value;
+      resultEl.textContent = "Adding to watchlist...";
+
+      try {
+        const resp = await fetch("/watchlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label, lat, lon }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          return;
+        }
+        resultEl.textContent = "Added " + data.label + " to your watchlist.";
+        form.reset();
+        loadWatchlist();
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+      }
+    });
+
+    watchlistBody.addEventListener("click", async (e) => {
+      const btn = e.target.closest(".delete-btn");
+      if (!btn) return;
+      btn.disabled = true;
+      try {
+        const resp = await fetch("/watchlist", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lat: btn.dataset.lat, lon: btn.dataset.lon }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          btn.disabled = false;
+          return;
+        }
+        resultEl.textContent = "Removed location from your watchlist.";
+        loadWatchlist();
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+        btn.disabled = false;
+      }
+    });
+
+    syncBtn.addEventListener("click", async () => {
+      syncBtn.disabled = true;
+      resultEl.textContent = "Syncing alerts + forecasts from the NWS API...";
+      try {
+        const resp = await fetch("/sync", { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          return;
+        }
+        resultEl.textContent = `Synced ${data.synced} documents across ${data.locations} location(s).`;
+        loadDocuments();
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+      } finally {
+        syncBtn.disabled = false;
+      }
+    });
+
+    loadWatchlist();
+    loadDocuments();
+  </script>
+</body>
+</html>
