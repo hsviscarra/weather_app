@@ -1,8 +1,14 @@
 # Databricks Workflow that runs notebooks/ingest_weather_embeddings.py on a
-# schedule. The notebook queries the `weather_watchlist` table for tracked
-# locations, fetches active alerts + forecast periods for those locations
-# directly from the free, keyless NWS API, and turns the resulting documents
-# into vector embeddings for the context-engineering course's RAG exercises.
+# schedule. The notebook is a plain psycopg2 script (no Spark) - it reads
+# whatever's already in weather_documents (populated separately via the
+# Flask app's POST /weather/sync), chunks + embeds the new rows, and writes
+# them into weather_embeddings.
+#
+# No job_clusters/new_cluster block - this task needs no Spark, so it runs
+# on serverless job compute by default. If your workspace doesn't have
+# serverless jobs enabled, add a job_cluster_key + new_cluster block back in
+# (any small general-purpose cluster works - the notebook doesn't touch
+# Spark either way).
 #
 # Deploy: databricks bundle deploy -t dev
 # Run once manually: databricks bundle run ingest_weather_embeddings_job -t dev
@@ -25,22 +31,15 @@ resources:
 
       max_concurrent_runs: 1
 
-      job_clusters:
-        - job_cluster_key: default_cluster
-          new_cluster:
-            spark_version: "15.4.x-scala2.12"
-            node_type_id: "i3.xlarge"
-            num_workers: 2
-            data_security_mode: SINGLE_USER
-
       tasks:
         - task_key: ingest_weather_embeddings
-          job_cluster_key: default_cluster
           notebook_task:
             notebook_path: ../notebooks/ingest_weather_embeddings.py
             base_parameters:
-              watchlist_table_name: "weather_watchlist"
               documents_table_name: "weather_documents"
               embeddings_table_name: "weather_embeddings"
               embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
-              nws_user_agent: "(weather_app, you@example.com)"
+              model_cache_path: "/Volumes/hv_external_catalog/weather_schema/ml_models"
+              chunk_size: "800"
+              chunk_overlap: "100"
+              batch_size: "100"

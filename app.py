@@ -43,28 +43,47 @@ EMBEDDINGS_TABLE_NAME = os.environ.get("WEATHER_EMBEDDINGS_TABLE_NAME", "weather
 # Must match the model used by notebooks/ingest_weather_embeddings.py to
 # write weather_embeddings - otherwise query vectors and stored vectors
 # wouldn't be comparable. MODEL_CACHE_PATH points at the same Unity Catalog
-# Volume the notebook caches the model into, so the app reads the
-# already-downloaded model instead of re-fetching it from Hugging Face on
-# every cold start (requires a Volume resource attached to the app - see
-# README). Only set via app.yaml on the deployed app - left unset locally,
-# where sentence-transformers falls back to its own default cache dir since
-# there's no real Volume mount outside Databricks.
+# Volume the notebook caches the model into (requires a Volume resource
+# attached to the app - see README). Only set via app.yaml on the deployed
+# app - left unset locally, where sentence-transformers falls back to its
+# own default cache dir since there's no real Volume mount outside
+# Databricks.
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 MODEL_CACHE_PATH = os.environ.get("MODEL_CACHE_PATH") or None
 
-_embedding_model = None
+# When pointed at a real Volume, force fully offline loading - serverless
+# compute has no reliable internet egress to download from Hugging Face at
+# runtime, so this must find the model already cached in the Volume (from
+# an earlier run on compute that DOES have internet access) rather than
+# attempting any network call, even a version-check ping.
+if MODEL_CACHE_PATH:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+def _load_embedding_model():
+    from sentence_transformers import SentenceTransformer
+
+    logger.info("Loading embedding model %s from %s ...", EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH)
+    return SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
+
+
+# Loaded once here at module level - not per-request - so /weather/search
+# never pays model-load cost on the request path. A load failure here
+# (e.g. the Volume resource isn't attached yet on a fresh deploy) is logged
+# but doesn't crash the whole app; _get_embedding_model() retries lazily on
+# the next call so a later successful redeploy self-heals without a code
+# change.
+try:
+    _embedding_model = _load_embedding_model()
+except Exception:
+    logger.exception("Failed to load embedding model at startup - /weather/search will retry lazily")
+    _embedding_model = None
 
 
 def _get_embedding_model():
-    """Lazily load (and cache in memory) the sentence-transformers model used
-    to embed search queries. Imported lazily too, so Flask starts instantly
-    when /weather/search is never called."""
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-
-        logger.info("Loading embedding model %s from %s ...", EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH)
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
+        _embedding_model = _load_embedding_model()
     return _embedding_model
 
 
@@ -415,8 +434,8 @@ def search_weather():
         rows = lakebase.run_query(
             f"""
             SELECT
-                e.id, e.document_id, e.chunk_index, e.chunk_text, e.model_name,
-                d.location, d.source_type, d.headline, d.issued_at,
+                d.id, d.location, d.headline, d.narrative_text, d.source_type, d.issued_at,
+                e.chunk_text, e.chunk_index, e.model_name,
                 1 - (e.embedding <=> %s::vector) AS similarity
             FROM {EMBEDDINGS_TABLE_NAME} e
             JOIN {DOCUMENTS_TABLE_NAME} d ON d.id = e.document_id
