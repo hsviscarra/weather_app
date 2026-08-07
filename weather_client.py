@@ -1,10 +1,12 @@
 """
-Client for the National Weather Service (NWS) API - api.weather.gov.
+Client for the National Weather Service (NWS) API - api.weather.gov - plus
+geocoding via Nominatim (OpenStreetMap), since NWS itself only accepts
+lat/lon, not place names.
 
-Free and keyless (unlike massive_client.py's Massive API), but NWS requires
-a descriptive User-Agent header identifying the app + contact info, or
-requests may be rate-limited/blocked. No secret scope needed for this
-client - only Lakebase needs one (see lakebase.py / setup_secrets.py).
+Both are free and keyless (unlike massive_client.py's Massive API), but both
+require a descriptive User-Agent header identifying the app + contact info,
+or requests may be rate-limited/blocked. No secret scope needed for either -
+only Lakebase needs one (see lakebase.py / setup_secrets.py).
 """
 
 import os
@@ -14,6 +16,7 @@ import requests
 
 _BASE_URL = os.environ.get("NWS_API_BASE_URL", "https://api.weather.gov")
 _USER_AGENT = os.environ.get("NWS_USER_AGENT", "(weather_app, contact@example.com)")
+_GEOCODE_URL = os.environ.get("GEOCODE_API_BASE_URL", "https://nominatim.openstreetmap.org/search")
 
 _DEFAULT_TIMEOUT = 30
 
@@ -59,3 +62,20 @@ class WeatherClient:
         forecast_url = point["properties"]["forecast"]
         data = self.get(forecast_url)
         return data["properties"]["periods"]
+
+    def geocode(self, place_name: str) -> tuple[float, float]:
+        """Resolve a place name (e.g. "Chicago, IL") to (lat, lon) via the
+        free, keyless Nominatim (OpenStreetMap) geocoder. Raises ValueError
+        if no match is found. Nominatim's usage policy caps requests at
+        1/sec - callers syncing multiple locations should pace calls (see
+        app.py's POST /weather/sync)."""
+        resp = self._session.get(
+            _GEOCODE_URL,
+            params={"q": place_name, "format": "json", "limit": 1},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if not results:
+            raise ValueError(f"Could not geocode location: {place_name!r}")
+        return float(results[0]["lat"]), float(results[0]["lon"])

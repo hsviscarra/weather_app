@@ -283,7 +283,7 @@
       syncBtn.disabled = true;
       resultEl.textContent = "Syncing alerts + forecasts from the NWS API...";
       try {
-        const resp = await fetch("/sync", { method: "POST" });
+        const resp = await fetch("/weather/sync", { method: "POST" });
         const data = await resp.json();
         if (!resp.ok) {
           resultEl.textContent = "Error: " + (data.error || resp.statusText);

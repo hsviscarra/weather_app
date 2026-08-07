@@ -1,12 +1,13 @@
 """
 Weather Watchlist - a small Databricks App backed by Lakebase.
 
-Users track locations (lat/lon) they care about. Syncing pulls active
-alerts and forecast periods for each watchlisted location from the
+Users track locations (lat/lon) they care about, or sync ad-hoc place names
+directly. Syncing pulls active alerts and forecast periods from the
 National Weather Service (NWS) API and normalizes them into the
 weather_documents table - the raw document store later turned into
-vector embeddings by notebooks/ingest_weather_embeddings.py for
-context-engineering / RAG exercises.
+chunked vector embeddings (weather_embeddings) by
+notebooks/ingest_weather_embeddings.py. POST /weather/search embeds a query
+at request time and runs a pgvector similarity search over those chunks.
 
 Run locally:
     python app.py
@@ -17,6 +18,9 @@ import hashlib
 import json
 import logging
 import os
+import time
+
+import psycopg2
 
 from dotenv import load_dotenv
 
@@ -34,6 +38,34 @@ app = Flask(__name__)
 
 WATCHLIST_TABLE_NAME = os.environ.get("WEATHER_WATCHLIST_TABLE_NAME", "weather_watchlist")
 DOCUMENTS_TABLE_NAME = os.environ.get("WEATHER_DOCUMENTS_TABLE_NAME", "weather_documents")
+EMBEDDINGS_TABLE_NAME = os.environ.get("WEATHER_EMBEDDINGS_TABLE_NAME", "weather_embeddings")
+
+# Must match the model used by notebooks/ingest_weather_embeddings.py to
+# write weather_embeddings - otherwise query vectors and stored vectors
+# wouldn't be comparable. MODEL_CACHE_PATH points at the same Unity Catalog
+# Volume the notebook caches the model into, so the app reads the
+# already-downloaded model instead of re-fetching it from Hugging Face on
+# every cold start (requires a Volume resource attached to the app - see
+# README). Only set via app.yaml on the deployed app - left unset locally,
+# where sentence-transformers falls back to its own default cache dir since
+# there's no real Volume mount outside Databricks.
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+MODEL_CACHE_PATH = os.environ.get("MODEL_CACHE_PATH") or None
+
+_embedding_model = None
+
+
+def _get_embedding_model():
+    """Lazily load (and cache in memory) the sentence-transformers model used
+    to embed search queries. Imported lazily too, so Flask starts instantly
+    when /weather/search is never called."""
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+
+        logger.info("Loading embedding model %s from %s ...", EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH)
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
+    return _embedding_model
 
 
 def ensure_watchlist_table():
@@ -200,35 +232,70 @@ def list_documents():
     return jsonify(rows)
 
 
-@app.route("/sync", methods=["POST"])
+@app.route("/weather/sync", methods=["POST"])
 def sync_weather():
-    """Pull active alerts + forecast periods for every watchlisted location
-    from the NWS API and upsert them into weather_documents."""
-    ensure_watchlist_table()
+    """Pull active alerts + forecast periods and upsert them into
+    weather_documents.
+
+    Body (optional JSON): {"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}
+    - locations: place names, geocoded via Nominatim then synced. If
+      omitted (or an empty list), falls back to the current deployment's
+      weather_watchlist entries (already lat/lon, no geocoding needed) -
+      this is what the UI's "Sync now" button calls, unchanged.
+    - limit: max alerts AND max forecast periods to persist per location
+      (applied independently to each source_type). Defaults to 50, clamped
+      to [1, 200].
+    """
     ensure_documents_table()
+    body = request.json if request.is_json else {}
 
-    locations = lakebase.run_query(f"SELECT DISTINCT label, lat, lon FROM {WATCHLIST_TABLE_NAME}")
-    if not locations:
-        return jsonify({"synced": 0, "locations": 0, "message": "Watchlist is empty - add a location first"})
+    try:
+        limit = int(body.get("limit", 50))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'limit' must be an integer"}), 400
+    limit = max(1, min(limit, 200))
 
+    raw_locations = body.get("locations")
     client = WeatherClient()
+
+    if raw_locations:
+        if not isinstance(raw_locations, list) or not all(isinstance(x, str) and x.strip() for x in raw_locations):
+            return jsonify({"error": "'locations' must be a non-empty list of place-name strings"}), 400
+
+        targets = []
+        for i, place in enumerate(raw_locations):
+            if i > 0:
+                time.sleep(1)  # respect Nominatim's 1 req/sec usage policy
+            try:
+                lat, lon = client.geocode(place.strip())
+                targets.append((place.strip(), lat, lon))
+            except Exception as exc:
+                logger.warning("Skipping %s: could not geocode (%s)", place, exc)
+    else:
+        ensure_watchlist_table()
+        watchlist_rows = lakebase.run_query(f"SELECT DISTINCT label, lat, lon FROM {WATCHLIST_TABLE_NAME}")
+        if not watchlist_rows:
+            return jsonify({"synced": 0, "locations": 0, "message": "No locations given and watchlist is empty"})
+        targets = [(row["label"], float(row["lat"]), float(row["lon"])) for row in watchlist_rows]
+
     total = 0
-    for loc in locations:
-        label, lat, lon = loc["label"], float(loc["lat"]), float(loc["lon"])
+    synced_locations = 0
+    for label, lat, lon in targets:
         try:
-            total += _sync_alerts(client, label, lat, lon)
-            total += _sync_forecast(client, label, lat, lon)
+            total += _sync_alerts(client, label, lat, lon, limit)
+            total += _sync_forecast(client, label, lat, lon, limit)
+            synced_locations += 1
         except Exception as exc:
             logger.warning("Skipping %s: %s", label, exc)
             continue
 
-    return jsonify({"synced": total, "locations": len(locations)})
+    return jsonify({"synced": total, "locations": synced_locations})
 
 
-def _sync_alerts(client: WeatherClient, label: str, lat: float, lon: float) -> int:
-    """Upsert active alerts for one location. Mirrors _upsert_batch in the
-    day-2 template's app.py."""
-    features = client.get_active_alerts(lat, lon)
+def _sync_alerts(client: WeatherClient, label: str, lat: float, lon: float, limit: int) -> int:
+    """Upsert active alerts for one location (up to `limit`). Mirrors
+    _upsert_batch in the day-2 template's app.py."""
+    features = client.get_active_alerts(lat, lon)[:limit]
     count = 0
     with lakebase.get_connection() as conn:
         with conn.cursor() as cur:
@@ -262,11 +329,11 @@ def _sync_alerts(client: WeatherClient, label: str, lat: float, lon: float) -> i
     return count
 
 
-def _sync_forecast(client: WeatherClient, label: str, lat: float, lon: float) -> int:
-    """Upsert forecast periods for one location. Each period has no natural
-    id from the API, so _forecast_doc_id() hashes location + start time
-    into a stable dedup key."""
-    periods = client.get_forecast_periods(lat, lon)
+def _sync_forecast(client: WeatherClient, label: str, lat: float, lon: float, limit: int) -> int:
+    """Upsert forecast periods for one location (up to `limit`). Each period
+    has no natural id from the API, so _forecast_doc_id() hashes location +
+    start time into a stable dedup key."""
+    periods = client.get_forecast_periods(lat, lon)[:limit]
     count = 0
     with lakebase.get_connection() as conn:
         with conn.cursor() as cur:
@@ -307,6 +374,74 @@ def _forecast_doc_id(lat: float, lon: float, period: dict) -> str:
     name (unique per location per forecast window)."""
     raw = f"{lat:.4f},{lon:.4f}:{period.get('startTime', '')}:{period.get('name', '')}"
     return "forecast:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+@app.route("/weather/search", methods=["POST"])
+def search_weather():
+    """Semantic search over weather_embeddings.
+
+    Body: {"query": "risk of flooding near rivers", "top_k": 5}
+
+    Embeds `query` with the same model notebooks/ingest_weather_embeddings.py
+    used to write weather_embeddings, then runs a pgvector cosine-distance
+    nearest-neighbor search, joined back to weather_documents for context.
+    """
+    body = request.json if request.is_json else {}
+
+    query = body.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({"error": "'query' is required and must be a non-empty string"}), 400
+    query = query.strip()
+
+    try:
+        top_k = int(body.get("top_k", 5))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'top_k' must be an integer"}), 400
+    top_k = max(1, min(top_k, 20))  # clamp, don't reject - see README edge cases
+
+    try:
+        query_embedding = _get_embedding_model().encode(query).tolist()
+    except Exception:
+        logger.exception("Failed to load embedding model or encode query")
+        return jsonify({"error": "Search is temporarily unavailable (embedding model failed to load)"}), 503
+
+    # pgvector has no native psycopg2 adapter - passing the vector as a
+    # bracketed literal string and casting with ::vector is the standard
+    # workaround. It's still a bound parameter (not string-interpolated
+    # into the query), so this isn't a SQL injection risk.
+    embedding_literal = "[" + ",".join(f"{x:.8f}" for x in query_embedding) + "]"
+
+    try:
+        rows = lakebase.run_query(
+            f"""
+            SELECT
+                e.id, e.document_id, e.chunk_index, e.chunk_text, e.model_name,
+                d.location, d.source_type, d.headline, d.issued_at,
+                1 - (e.embedding <=> %s::vector) AS similarity
+            FROM {EMBEDDINGS_TABLE_NAME} e
+            JOIN {DOCUMENTS_TABLE_NAME} d ON d.id = e.document_id
+            ORDER BY e.embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (embedding_literal, embedding_literal, top_k),
+        )
+    except psycopg2.errors.UndefinedTable:
+        return jsonify(
+            {
+                "results": [],
+                "query": query,
+                "message": (
+                    f"{EMBEDDINGS_TABLE_NAME} doesn't exist yet - run "
+                    "sql/02_setup_weather_embeddings_table.sql, then the "
+                    "ingest_weather_embeddings notebook."
+                ),
+            }
+        )
+
+    if not rows:
+        return jsonify({"results": [], "query": query, "message": "No embeddings synced yet."})
+
+    return jsonify({"results": rows, "query": query, "top_k": top_k})
 
 
 if __name__ == "__main__":

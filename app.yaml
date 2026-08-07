@@ -9,3 +9,7 @@ env:
     value: "lakebase-url"
   - name: NWS_USER_AGENT
     value: "(weather_app, you@example.com)"
+  - name: EMBEDDING_MODEL_NAME
+    value: "sentence-transformers/all-MiniLM-L6-v2"
+  - name: MODEL_CACHE_PATH
+    value: "/Volumes/hv_external_catalog/weather_schema/ml_models"

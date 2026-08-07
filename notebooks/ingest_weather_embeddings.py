@@ -17,22 +17,24 @@
 # MAGIC    periods (`GET /points/...` -> `GET /gridpoints/.../forecast`) for
 # MAGIC    those locations directly from the free, keyless NWS API
 # MAGIC    (api.weather.gov - see weather_client.py for the same call shape
-# MAGIC    used by the Flask app's `POST /sync` route), and upserts the results
-# MAGIC    into the `weather_documents` table.
-# MAGIC 3. Computes a sentence embedding for each document's narrative text
-# MAGIC    using Spark, distributed across the cluster via a pandas UDF, and
-# MAGIC    writes them into a `weather_documents_embeddings` table using the
-# MAGIC    `pgvector` Postgres extension so downstream RAG / context-engineering
-# MAGIC    exercises can run similarity search directly in Postgres.
+# MAGIC    used by the Flask app's `POST /weather/sync` route), and upserts
+# MAGIC    the results into the `weather_documents` table.
+# MAGIC 3. Splits each document's headline + narrative_text into overlapping
+# MAGIC    chunks, computes a sentence embedding per chunk using Spark
+# MAGIC    (distributed across the cluster via a pandas UDF), and writes them
+# MAGIC    into a `weather_embeddings` table (`document_id`, `chunk_index`,
+# MAGIC    `chunk_text`, `embedding`) using the `pgvector` Postgres extension,
+# MAGIC    so `POST /weather/search` can run similarity search directly in
+# MAGIC    Postgres.
 # MAGIC
 # MAGIC It re-uses the SAME Lakebase secret (scope `database`, key `lakebase-url`)
 # MAGIC that `lakebase.py` uses in the Flask app, so no extra secrets need to be
-# MAGIC created for this notebook. Unlike the stock-news version of this
-# MAGIC notebook, there's no chunking/full-article-scraping step - alert and
-# MAGIC forecast text is already short and self-contained, so one embedding per
-# MAGIC document is enough. There's also no strict rate limit to work around -
-# MAGIC the NWS API is free and keyless, it just requires a descriptive
-# MAGIC User-Agent header.
+# MAGIC created for this notebook. Unlike the stock-news template, there's no
+# MAGIC article-URL-fetching step - `narrative_text` already IS the full
+# MAGIC content, so chunking splits it directly rather than scraping an
+# MAGIC external page with `trafilatura`. There's also no strict rate limit to
+# MAGIC work around - the NWS API is free and keyless, it just requires a
+# MAGIC descriptive User-Agent header.
 
 # COMMAND ----------
 
@@ -55,7 +57,7 @@ dbutils.library.restartPython()
 
 dbutils.widgets.text("watchlist_table_name", "weather_watchlist", "Source table (watched locations)")
 dbutils.widgets.text("documents_table_name", "weather_documents", "Destination table (raw documents)")
-dbutils.widgets.text("embeddings_table_name", "weather_documents_embeddings", "Destination table (vectors)")
+dbutils.widgets.text("embeddings_table_name", "weather_embeddings", "Destination table (vectors)")
 dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
 dbutils.widgets.text("nws_user_agent", "(weather_app, you@example.com)", "NWS API User-Agent (required by api.weather.gov)")
 
@@ -150,8 +152,8 @@ except Exception as e:
 # MAGIC your Lakebase Postgres database:
 # MAGIC
 # MAGIC 1. Run `sql/01_setup_weather_documents_table.sql` to create `weather_documents`
-# MAGIC 2. Run `sql/02_setup_weather_documents_embeddings_table.sql` to create
-# MAGIC    `weather_documents_embeddings` - replace `{{EMBEDDING_DIM}}` with the
+# MAGIC 2. Run `sql/02_setup_weather_embeddings_table.sql` to create
+# MAGIC    `weather_embeddings` - replace `{{EMBEDDING_DIM}}` with the
 # MAGIC    value printed above (384 for the default model).
 # MAGIC
 # MAGIC `weather_watchlist` doesn't need a manual setup script - the Flask app
@@ -164,7 +166,7 @@ except Exception as e:
 # MAGIC ## Fetch alerts + forecasts from the NWS API for watchlisted locations
 # MAGIC
 # MAGIC This ETL is self-contained: it queries the `weather_watchlist` table
-# MAGIC directly (not the Flask app's `/sync` route) so the scheduled Job doesn't
+# MAGIC directly (not the Flask app's `/weather/sync` route) so the scheduled Job doesn't
 # MAGIC depend on anyone having triggered a sync from the UI. Requests are made
 # MAGIC serially with a short pause between locations as a courtesy to the API -
 # MAGIC unlike the Massive API in the stock-news version of this notebook, NWS
@@ -323,14 +325,11 @@ else:
 docs_df = (
     spark.read.jdbc(url=jdbc_url, table=DOCUMENTS_TABLE_NAME, properties=jdbc_properties)
     .selectExpr(
-        "id",
-        "location",
-        "headline",
-        "issued_at",
+        "id AS document_id",
         # Embed on headline + narrative_text together for richer context.
-        "trim(concat(coalesce(headline, ''), '. ', coalesce(narrative_text, ''))) AS embedding_text",
+        "trim(concat(coalesce(headline, ''), '. ', coalesce(narrative_text, ''))) AS full_text",
     )
-    .filter("embedding_text IS NOT NULL AND embedding_text != ''")
+    .filter("full_text IS NOT NULL AND full_text != ''")
 )
 
 print(f"Loaded {docs_df.count()} weather documents from {DOCUMENTS_TABLE_NAME}")
@@ -339,11 +338,72 @@ display(docs_df.limit(5))
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Chunk each document's text
+# MAGIC
+# MAGIC Unlike the stock-news template (which fetches and chunks full article
+# MAGIC bodies via `trafilatura`), there's no external URL to fetch here -
+# MAGIC `narrative_text` already IS the full content. Most forecast periods and
+# MAGIC many alerts are short enough to stay as a single chunk; long alert
+# MAGIC descriptions (multi-paragraph warnings) split into multiple overlapping
+# MAGIC chunks so `weather_embeddings` matches the day-2 template's chunked
+# MAGIC shape (`document_id`, `chunk_index`, `chunk_text`) even when most
+# MAGIC documents only produce one chunk.
+
+# COMMAND ----------
+
+dbutils.widgets.text("chunk_size", "800", "Chunk size (chars)")
+dbutils.widgets.text("chunk_overlap", "100", "Chunk overlap (chars)")
+
+CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
+CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
+
+from typing import Iterator
+
+import pandas as pd
+from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+chunks_schema = StructType(
+    [
+        StructField("document_id", StringType(), False),
+        StructField("chunk_index", IntegerType(), False),
+        StructField("chunk_text", StringType(), False),
+    ]
+)
+
+
+def chunk_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
+    for batch in iterator:
+        out_doc_ids, out_indexes, out_texts = [], [], []
+        for document_id, text in zip(batch["document_id"], batch["full_text"]):
+            step = max(CHUNK_SIZE - CHUNK_OVERLAP, 1)
+            for chunk_index, start in enumerate(range(0, len(text), step)):
+                chunk_text = text[start : start + CHUNK_SIZE].strip()
+                if not chunk_text:
+                    continue
+                out_doc_ids.append(document_id)
+                out_indexes.append(chunk_index)
+                out_texts.append(chunk_text)
+                if start + CHUNK_SIZE >= len(text):
+                    break
+        yield pd.DataFrame({"document_id": out_doc_ids, "chunk_index": out_indexes, "chunk_text": out_texts})
+
+
+chunks_df = docs_df.mapInPandas(chunk_partitions, schema=chunks_schema)
+
+print(f"Split {docs_df.count()} documents into {chunks_df.count()} chunks")
+display(chunks_df.limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Compute embeddings (distributed pandas UDF)
 # MAGIC
 # MAGIC Loads the sentence-transformers model once per executor process (not per
 # MAGIC row) and applies it in batches via `mapInPandas`, which scales across
-# MAGIC however many workers the cluster has.
+# MAGIC however many workers the cluster has. `MODEL_CACHE_PATH` is a Unity
+# MAGIC Catalog Volume so the model downloads once and every worker (and the
+# MAGIC Flask app's `/weather/search`, via the same env var) reads the same
+# MAGIC cached copy instead of re-fetching from Hugging Face.
 
 # COMMAND ----------
 
@@ -351,7 +411,8 @@ display(docs_df.limit(5))
 from sentence_transformers import SentenceTransformer
 
 # Unity Catalog Volume path (writable, accessible by all workers) - adjust
-# the catalog/schema to one your workspace actually has.
+# the catalog/schema to one your workspace actually has. Must match
+# MODEL_CACHE_PATH in app.py / app.yaml.
 MODEL_CACHE_PATH = "/Volumes/hv_external_catalog/weather_schema/ml_models"
 
 print(f"Downloading {EMBEDDING_MODEL_NAME} to {MODEL_CACHE_PATH}...")
@@ -360,17 +421,13 @@ print(f"Model downloaded and cached at {MODEL_CACHE_PATH}")
 
 # COMMAND ----------
 
-from typing import Iterator
-
-import pandas as pd
-from pyspark.sql.types import ArrayType, FloatType, StringType, StructField, StructType
+from pyspark.sql.types import ArrayType, FloatType
 
 embeddings_schema = StructType(
     [
-        StructField("id", StringType(), False),
-        StructField("location", StringType(), False),
-        StructField("headline", StringType(), False),
-        StructField("issued_at", StringType(), True),
+        StructField("document_id", StringType(), False),
+        StructField("chunk_index", IntegerType(), False),
+        StructField("chunk_text", StringType(), False),
         StructField("embedding", ArrayType(FloatType()), False),
     ]
 )
@@ -378,27 +435,26 @@ embeddings_schema = StructType(
 
 def embed_partitions(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
     """Runs once per Spark partition/task: load the model once, then embed
-    every batch of rows handed to this partition."""
+    every batch of chunks handed to this partition."""
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(EMBEDDING_MODEL_NAME, cache_folder=MODEL_CACHE_PATH)
 
     for batch in iterator:
-        vectors = model.encode(batch["embedding_text"].tolist(), show_progress_bar=False)
+        vectors = model.encode(batch["chunk_text"].tolist(), show_progress_bar=False)
         yield pd.DataFrame(
             {
-                "id": batch["id"],
-                "location": batch["location"],
-                "headline": batch["headline"],
-                "issued_at": batch["issued_at"].astype(str),
+                "document_id": batch["document_id"],
+                "chunk_index": batch["chunk_index"],
+                "chunk_text": batch["chunk_text"],
                 "embedding": [v.tolist() for v in vectors],
             }
         )
 
 
-embeddings_df = docs_df.mapInPandas(embed_partitions, schema=embeddings_schema)
+embeddings_df = chunks_df.mapInPandas(embed_partitions, schema=embeddings_schema)
 
-print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}")
+print(f"Computed {embeddings_df.count()} chunk embeddings using {EMBEDDING_MODEL_NAME}")
 
 # COMMAND ----------
 
@@ -411,27 +467,27 @@ print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}
 
 # COMMAND ----------
 
-print(f"Required EMBEDDING_DIM for SQL setup: {EMBEDDING_DIM}")
+print(f"Required embedding dimension: {EMBEDDING_DIM}")
 print(f"Table name: {EMBEDDINGS_TABLE_NAME}")
-print("\nRun sql/02_setup_weather_documents_embeddings_table.sql in your Lakebase database before continuing.")
+print("\nRun sql/02_setup_weather_embeddings_table.sql in your Lakebase database before continuing.")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Upsert embeddings into Lakebase
 # MAGIC
-# MAGIC Written via JDBC batch writes. Each embedding lands as a
-# MAGIC `DOUBLE PRECISION[]` array - cast to Postgres' `vector` type via the
-# MAGIC `::vector` SQL step printed at the end of this cell.
+# MAGIC Written via JDBC batch writes, same pattern as the day-2 template. Each
+# MAGIC embedding lands as a `DOUBLE PRECISION[]` array - cast to Postgres'
+# MAGIC `vector` type via the `::vector` SQL step printed at the end of this cell.
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, current_timestamp, expr, lit, to_timestamp
+from pyspark.sql.functions import current_timestamp, expr, lit
 
 embeddings_with_meta = (
-    embeddings_df.withColumn("model_name", lit(EMBEDDING_MODEL_NAME))
-    .withColumn("embedded_at", current_timestamp())
-    .withColumn("issued_at", to_timestamp(col("issued_at")))
+    embeddings_df.withColumn("id", expr("concat(document_id, '_', chunk_index)"))
+    .withColumn("model_name", lit(EMBEDDING_MODEL_NAME))
+    .withColumn("created_at", current_timestamp())
 )
 
 # Convert embedding array from ArrayType(FloatType) to ArrayType(DoubleType) -
@@ -453,7 +509,9 @@ except Exception:
 
 embedding_count = new_embeddings.count()
 if embedding_count > 0:
-    new_embeddings.write.format("postgresql") \
+    new_embeddings.select(
+        "id", "document_id", "chunk_index", "chunk_text", "embedding", "model_name", "created_at"
+    ).write.format("postgresql") \
         .option("host", parsed.hostname) \
         .option("port", parsed.port or 5432) \
         .option("database", parsed.path.lstrip("/")) \
@@ -462,7 +520,7 @@ if embedding_count > 0:
         .option("password", parsed.password) \
         .mode("append") \
         .save()
-    print(f"Wrote {embedding_count} new embeddings to {EMBEDDINGS_TABLE_NAME}")
+    print(f"Wrote {embedding_count} new chunk embeddings to {EMBEDDINGS_TABLE_NAME}")
     print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
     print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
 else:
@@ -492,15 +550,16 @@ except Exception as e:
     print(f"Error: {e}")
 
 print("\n" + "=" * 100)
-print(f"{EMBEDDINGS_TABLE_NAME} (Vectors)")
+print(f"{EMBEDDINGS_TABLE_NAME} (Chunk Vectors)")
 print("-" * 100)
 try:
     embeddings_check = spark.read.jdbc(url=jdbc_url, table=EMBEDDINGS_TABLE_NAME, properties=jdbc_properties)
     embeddings_count = embeddings_check.count()
     print(f"Total rows: {embeddings_count}")
     if embeddings_count > 0:
+        print(f"\nDistinct documents: {embeddings_check.select('document_id').distinct().count()}")
         print("\nSample records:")
-        embeddings_check.select("id", "location", "headline", "model_name", "embedded_at").show(5, truncate=50)
+        embeddings_check.select("id", "document_id", "chunk_index", "model_name", "created_at").show(5, truncate=50)
         first_embedding = embeddings_check.select("embedding").first()
         if first_embedding:
             emb_array = first_embedding["embedding"]

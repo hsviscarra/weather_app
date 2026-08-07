@@ -41,6 +41,6 @@ resources:
             base_parameters:
               watchlist_table_name: "weather_watchlist"
               documents_table_name: "weather_documents"
-              embeddings_table_name: "weather_documents_embeddings"
+              embeddings_table_name: "weather_embeddings"
               embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
               nws_user_agent: "(weather_app, you@example.com)"
